@@ -1,0 +1,6 @@
+*.csv
+*.parquet
+/saved_models
+/results
+*.npy
+*.pth
