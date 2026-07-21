@@ -1,18 +1,21 @@
 import duckdb
-import pandas as pd
 import os
-import glob
-from tqdm import tqdm
+
+os.makedirs("1preprocessing/preprocessed_data", exist_ok=True)
 
 print("==================================================")
-print(" PHASE 1: EXTRACTING FULL UNCENSORED HISTORY ")
+print(" PHASE 1: EXTRACTING CENSORED HISTORY (LEAKAGE-SAFE) ")
 print("==================================================")
 
 # 1. Connect to DuckDB
 con = duckdb.connect()
 
-# Combine Diagnoses and Labs/Vitals (NO MEDICATIONS). 
-# Notice there is NO 'WHERE' clause here to censor dates. We want the full history!
+# Combine Diagnoses and Labs/Vitals (NO MEDICATIONS).
+# IMPORTANT: apply the SAME temporal censoring rule as 01_build_universal_events.py.
+# For diabetic patients, only events strictly BEFORE their Index_Date (first T2D
+# diagnosis) are kept. This prevents the MLM pretraining from ever seeing the
+# diabetes diagnosis code itself, or any post-diagnosis labs/vitals/complications,
+# for the exact patients that later become the fine-tuning cohort.
 query = """
     WITH Diagnosis AS (
         SELECT 
@@ -27,96 +30,184 @@ query = """
             CAST(DATE AS DATE) AS DATE, 
             CODE 
         FROM read_csv_auto('0data/discretized_labs_vitals.csv')
+    ),
+    Uncensored_Events AS (
+        SELECT * FROM Diagnosis
+        UNION ALL
+        SELECT * FROM LabsVitals
+    ),
+    Diabetes_dates AS (
+        -- CRITICAL FIX: EARLIEST_dx_deid.csv has ONE ROW PER (PATIENT_ID, DX)
+        -- pair, not one row per patient -- each distinct diagnosis code has
+        -- its own "first occurrence" date. Without MIN()+GROUP BY, the JOIN
+        -- below would match each event against ALL of a patient's index
+        -- dates, and an event only needs to be before ONE of them to pass
+        -- the WHERE filter -- letting events AFTER the patient's TRUE
+        -- earliest diagnosis leak through as long as they're before some
+        -- LATER "first occurrence of a different diabetes code" date.
+        SELECT
+            PATIENT_ID,
+            MIN(CAST(EARLIEST_DX AS DATE)) AS Index_Date
+        FROM read_csv_auto('0data/EARLIEST_dx_deid.csv')
+        GROUP BY PATIENT_ID
     )
-    SELECT * FROM Diagnosis
-    UNION ALL
-    SELECT * FROM LabsVitals
+    -- GOLDEN RULE (same as 01_build_universal_events.py):
+    -- Non-diabetic patients (no Index_Date) keep their full history.
+    -- Diabetic patients only keep events strictly before their Index_Date.
+    SELECT 
+        u.PATIENT_ID, 
+        u.DATE, 
+        u.CODE
+    FROM Uncensored_Events u
+    LEFT JOIN Diabetes_dates f ON u.PATIENT_ID = f.PATIENT_ID
+    WHERE f.Index_Date IS NULL OR u.DATE < f.Index_Date
 """
 
-print("Executing DuckDB query to combine all events...")
-con.execute(f"COPY ({query}) TO '1preprocessing/preprocessed_data/temp_uncensored_events.parquet' (FORMAT PARQUET);")
+print("Executing DuckDB query to combine and censor all events...")
+con.execute(f"COPY ({query}) TO '1preprocessing/preprocessed_data/temp_pretrain_events_censored.parquet' (FORMAT PARQUET);")
 
 
 print("\n==================================================")
-print(" PHASE 2: BUILDING LONGITUDINAL SEQUENCES ")
+print(" PHASE 1.5: CALCULATING AGE PER EVENT (in DuckDB) ")
 print("==================================================")
+# IMPORTANT: this used to be a pandas `events_df.merge(patient_info, ...)`
+# on the full ~80M-row events table, which is exactly the kind of operation
+# that blows up with ArrowMemoryError on a PyArrow-backed pandas frame this
+# large. Doing the join/aggregation in DuckDB instead avoids ever
+# materializing that merge as a pandas object -- only the small, already
+# age-annotated result gets written out.
+age_query = """
+    WITH Events AS (
+        SELECT PATIENT_ID, DATE, CODE
+        FROM read_parquet('1preprocessing/preprocessed_data/temp_pretrain_events_censored.parquet')
+    ),
+    LastVisit AS (
+        SELECT PATIENT_ID, MAX(DATE) AS LAST_VISIT_DATE
+        FROM Events
+        GROUP BY PATIENT_ID
+    ),
+    Demo AS (
+        SELECT PATIENT_ID, AGE_AT_END
+        FROM read_csv_auto('0data/deid_DEM.csv')
+    ),
+    PatientInfo AS (
+        SELECT
+            lv.PATIENT_ID,
+            EXTRACT(YEAR FROM lv.LAST_VISIT_DATE) - d.AGE_AT_END AS YOB
+        FROM LastVisit lv
+        INNER JOIN Demo d ON lv.PATIENT_ID = d.PATIENT_ID
+    )
+    SELECT
+        e.PATIENT_ID,
+        e.DATE,
+        e.CODE,
+        CAST(GREATEST(EXTRACT(YEAR FROM e.DATE) - p.YOB, 0) AS VARCHAR) AS AGE
+    FROM Events e
+    INNER JOIN PatientInfo p ON e.PATIENT_ID = p.PATIENT_ID
+    ORDER BY e.PATIENT_ID, e.DATE
+"""
+print("Executing DuckDB query to join demographics and compute AGE per event...")
+con.execute(
+    f"COPY ({age_query}) TO "
+    f"'1preprocessing/preprocessed_data/temp_pretrain_events_with_age.parquet' (FORMAT PARQUET);"
+)
 
-events_df = pd.read_parquet('1preprocessing/preprocessed_data/temp_uncensored_events.parquet')
-demo_df = pd.read_csv('0data/deid_DEM.csv')
 
-events_df['DATE'] = pd.to_datetime(events_df['DATE'])
-events_df['CODE'] = events_df['CODE'].astype(str)
+print("\n==================================================")
+print(" PHASE 2: BUILDING LONGITUDINAL SEQUENCES (in DuckDB) ")
+print("==================================================")
+# IMPORTANT: this used to build sequences with pandas chunked groupby-apply
+# and then call pandas' df.to_parquet(), which goes through
+# pyarrow.Table.from_pandas() -- a DIFFERENT and much less robust code path
+# for huge list columns than DuckDB's native read/write. That is what was
+# crashing with ArrowMemoryError even though DuckDB itself handles these
+# same huge lists without any issue (as already proven in
+# 02_format_for_finetuning.py). Rewritten here to keep everything in DuckDB,
+# split into PATIENT BUCKETS since DuckDB's list()/array_agg() aggregation
+# does not support spilling to disk -- bucketing bounds how many patients'
+# worth of data any single query has to hold in memory at once.
 
-print("Calculating dynamic age for each visit...")
-# Find the LAST visit date for each patient to calculate their birth year
-last_visits = events_df.groupby('PATIENT_ID')['DATE'].max().reset_index()
-last_visits = last_visits.rename(columns={'DATE': 'LAST_VISIT_DATE'})
+TMP_DIR = "1preprocessing/preprocessed_data"
+N_BUCKETS = 20  # increase if you still hit OutOfMemory with your real data
 
-demo_subset = demo_df[['PATIENT_ID', 'AGE_AT_END']]
-patient_info = last_visits.merge(demo_subset, on='PATIENT_ID', how='inner')
+os.makedirs(f"{TMP_DIR}/pretrain_output_buckets", exist_ok=True)
 
-# Calculate Year of Birth (YOB)
-patient_info['YOB'] = patient_info['LAST_VISIT_DATE'].dt.year - patient_info['AGE_AT_END']
+# Stage 2a: assign each patient to a bucket, partitioned on disk
+print("\n[1/3] Assigning patient buckets...")
+bucket_query = f"""
+    SELECT *, ABS(HASH(PATIENT_ID)) % {N_BUCKETS} AS bucket
+    FROM read_parquet('{TMP_DIR}/temp_pretrain_events_with_age.parquet')
+"""
+con.execute(
+    f"COPY ({bucket_query}) TO '{TMP_DIR}/pretrain_events_bucketed' "
+    f"(FORMAT PARQUET, PARTITION_BY (bucket));"
+)
+print("Bucket assignment done.")
 
-# Merge YOB back to all events and calculate specific age per event
-df = events_df.merge(patient_info[['PATIENT_ID', 'YOB']], on='PATIENT_ID', how='inner')
-df['AGE'] = df['DATE'].dt.year - df['YOB']
-df['AGE'] = df['AGE'].apply(lambda x: max(0, x)).astype(str) # No negative ages, string format for BEHRT
+# Stage 2b: process one bucket of patients at a time -- group into visits
+# AND flatten into per-patient sequences in a single query per bucket.
+# NOTE: events on the same calendar day have no meaningful sub-day ordering
+# (truncated to DATE granularity), so 'ORDER BY CODE' just makes the
+# within-day order deterministic/reproducible instead of depending on
+# arbitrary scan order.
+print(f"\n[2/3] Processing {N_BUCKETS} patient buckets...")
+for b in range(N_BUCKETS):
+    bucket_dir = f"{TMP_DIR}/pretrain_events_bucketed/bucket={b}"
+    if not os.path.exists(bucket_dir):
+        print(f"  Bucket {b}: no data, skipping.")
+        continue
 
-print("Sorting chronologically...")
-df = df.sort_values(by=['PATIENT_ID', 'DATE'])
+    output_path = f"{TMP_DIR}/pretrain_output_buckets/bucket_{b}.parquet"
+    if os.path.exists(output_path):
+        print(f"  Bucket {b}: already processed, skipping.")
+        continue
 
-def process_visit(group):
-    visit_codes = group['CODE'].tolist() + ['SEP']
-    visit_ages = group['AGE'].tolist()
-    if len(visit_ages) > 0:
-        visit_ages.append(visit_ages[-1]) 
-    return pd.Series({'code': visit_codes, 'age': visit_ages})
+    bucket_query = f"""
+        WITH VisitLevel AS (
+            SELECT
+                PATIENT_ID,
+                DATE,
+                list(CODE ORDER BY CODE) || ['SEP'] AS codes_seq,
+                list(AGE ORDER BY CODE) || [first(AGE)] AS ages_seq
+            FROM read_parquet('{bucket_dir}/*.parquet')
+            GROUP BY PATIENT_ID, DATE
+        ),
+        PatientLevel AS (
+            SELECT
+                PATIENT_ID AS patid,
+                flatten(list(codes_seq ORDER BY DATE)) AS code,
+                flatten(list(ages_seq ORDER BY DATE)) AS age
+            FROM VisitLevel
+            GROUP BY PATIENT_ID
+        )
+        -- Filter out patients with less than 2 codes (the model needs
+        -- context to learn).
+        SELECT * FROM PatientLevel WHERE len(code) >= 2
+    """
+    con.execute(f"COPY ({bucket_query}) TO '{output_path}' (FORMAT PARQUET);")
+    print(f"  Bucket {b}: done.")
 
-print("Batch processing visits (this might take a minute)...")
-os.makedirs('1preprocessing/preprocessed_data/temp_pretrain_visits', exist_ok=True)
-unique_patients = df['PATIENT_ID'].unique()
-chunk_size = 5000 
-total_chunks = (len(unique_patients) // chunk_size) + 1
+print("Stage 2 done.")
 
-for i in tqdm(range(total_chunks), desc="Grouping Visits"):
-    chunk_file = f'1preprocessing/preprocessed_data/temp_pretrain_visits/visit_chunk_{i}.parquet'
-    if not os.path.exists(chunk_file):
-        batch_ids = unique_patients[i*chunk_size : (i+1)*chunk_size]
-        batch_df = df[df['PATIENT_ID'].isin(batch_ids)]
-        visits_batch = batch_df.groupby(['PATIENT_ID', 'DATE']).apply(process_visit).reset_index()
-        visits_batch.to_parquet(chunk_file)
-
-all_visit_files = glob.glob('1preprocessing/preprocessed_data/temp_pretrain_visits/visit_chunk_*.parquet')
-visits_df = pd.concat([pd.read_parquet(f) for f in all_visit_files])
-
-print("Flattening sequences for each patient...")
-os.makedirs('1preprocessing/preprocessed_data/temp_pretrain_patients', exist_ok=True)
-
-def process_patient(group):
-    patient_codes = [code for visit in group['code'] for code in visit]
-    patient_ages = [age for visit in group['age'] for age in visit]
-    return pd.Series({'code': patient_codes, 'age': patient_ages})
-
-for i in tqdm(range(total_chunks), desc="Flattening Patients"):
-    chunk_file = f'1preprocessing/preprocessed_data/temp_pretrain_patients/patient_chunk_{i}.parquet'
-    if not os.path.exists(chunk_file):
-        batch_ids = unique_patients[i*chunk_size : (i+1)*chunk_size]
-        batch_df = visits_df[visits_df['PATIENT_ID'].isin(batch_ids)]
-        patient_batch = batch_df.groupby('PATIENT_ID').apply(process_patient).reset_index()
-        patient_batch.to_parquet(chunk_file)
-
-all_patient_files = glob.glob('1preprocessing/preprocessed_data/temp_pretrain_patients/patient_chunk_*.parquet')
-final_behrt_df = pd.concat([pd.read_parquet(f) for f in all_patient_files])
-
-final_behrt_df = final_behrt_df.rename(columns={'PATIENT_ID': 'patid'})
-
-# Filter out patients with less than 2 codes (the model needs context to learn)
-final_behrt_df = final_behrt_df[final_behrt_df['code'].apply(len) >= 2]
-
-final_behrt_df.to_parquet('1preprocessing/preprocessed_data/behrt_pretrain_data.parquet', index=False)
+# Stage 2c: concatenate all per-bucket outputs into the final parquet
+print("\n[3/3] Concatenating all buckets into the final file...")
+concat_query = f"SELECT * FROM read_parquet('{TMP_DIR}/pretrain_output_buckets/bucket_*.parquet')"
+con.execute(
+    f"COPY ({concat_query}) TO "
+    f"'{TMP_DIR}/behrt_pretrain_data.parquet' (FORMAT PARQUET);"
+)
 
 print("\n==================================================")
 print(" SUCCESS! PRE-TRAINING DATA READY ")
-print(" Saved as: '1preprocessing/preprocessed_data/behrt_pretrain_data.parquet' ")
+print(f" Saved as: '{TMP_DIR}/behrt_pretrain_data.parquet' ")
 print("==================================================")
+
+summary = con.execute(f"""
+    SELECT
+        COUNT(*) AS n_patients,
+        AVG(len(code)) AS avg_seq_len,
+        MAX(len(code)) AS max_seq_len
+    FROM read_parquet('{TMP_DIR}/behrt_pretrain_data.parquet')
+""").df()
+print("\nSummary:")
+print(summary.to_string(index=False))

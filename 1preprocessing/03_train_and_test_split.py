@@ -1,50 +1,92 @@
-import pandas as pd
+"""
+03_train_and_test_split.py
+
+Splits behrt_finetuning_data.parquet into train/test sets with labels.
+
+IMPORTANT: the sequence data ('code'/'age' columns) is kept entirely in
+DuckDB for both reading AND writing. Converting it to a pandas DataFrame and
+then calling df.to_parquet() goes through pyarrow.Table.from_pandas(), which
+is a DIFFERENT (and much less robust) code path than DuckDB's native
+read/write for huge list columns -- this is what was crashing with
+ArrowMemoryError on df_train.to_parquet(), even though DuckDB itself handles
+these same huge lists (patients with 200k+ tokens) without any issue.
+
+Only a small (patid, label) table -- no list columns -- is ever converted to
+pandas, because sklearn's train_test_split needs it for the stratified
+split. The actual sequence rows are filtered and written by DuckDB using the
+patient ID sets computed from that split.
+"""
+
 import duckdb
 from sklearn.model_selection import train_test_split
 
-print("1. Loading censored sequences for Fine-Tuning...")
-df_seq = pd.read_parquet('data/behrt_finetuning_data.parquet')
+con = duckdb.connect()
 
-print("2. Extracting AIM_GROUP label from the database...")
-# Use DuckDB to quickly extract the ID -> AIM_GROUP mapping without loading the giant CSV into memory
-query = """
-    SELECT DISTINCT PATIENT_ID, AIM_GROUP 
-    FROM read_csv_auto('data/deid_visit_dx.csv')
+print("1. Extracting AIM_GROUP label from the database...")
+label_query = """
+    SELECT DISTINCT PATIENT_ID, AIM_GROUP
+    FROM read_csv_auto('0data/deid_visit_dx.csv')
 """
-df_labels = duckdb.query(query).df()
+con.execute(f"CREATE OR REPLACE TEMP TABLE raw_labels AS ({label_query})")
 
-print("3. Merging data and mapping labels...")
-# Merge sequences with their final label
-df_final = pd.merge(df_seq, df_labels, left_on='patid', right_on='PATIENT_ID', how='inner')
+print("2. Building a small (patid, label, code_len) table for the split "
+      "-- no sequence data is materialized here...")
+combined_query = """
+    SELECT
+        seq.patid,
+        CASE lbl.AIM_GROUP
+            WHEN '1_NoD' THEN 0
+            WHEN '2_Type2' THEN 1
+            ELSE NULL
+        END AS label,
+        len(seq.code) AS code_len
+    FROM read_parquet('0data/behrt_finetuning_data.parquet') seq
+    INNER JOIN raw_labels lbl ON seq.patid = lbl.PATIENT_ID
+"""
+con.execute(f"CREATE OR REPLACE TEMP TABLE patient_labels AS ({combined_query})")
 
-# Convert text to binary numbers for the neural network
-df_final['label'] = df_final['AIM_GROUP'].map({'1_NoD': 0, '2_Type2': 1})
-df_final = df_final.dropna(subset=['label'])
-df_final['label'] = df_final['label'].astype(int)
+# Filter: valid label + at least 2 codes of history (same rule as before)
+con.execute("""
+    CREATE OR REPLACE TEMP TABLE patient_labels_filtered AS
+    SELECT patid, label
+    FROM patient_labels
+    WHERE label IS NOT NULL AND code_len >= 2
+""")
 
-# IMPORTANT: Due to censoring, some diabetic patients might end up with 0 previous visits.
-# We filter to keep only patients with at least 2 codes in their history
-# so the model actually has some context to read.
-df_final = df_final[df_final['code'].apply(len) >= 2]
+patient_labels_df = con.execute("SELECT * FROM patient_labels_filtered").df()
+print(f"   {len(patient_labels_df)} patients with a valid label and >= 2 codes.")
 
-print("4. Splitting into Train (80%) and Test (20%)...")
-# Stratified split to maintain the same proportion of diabetics in both sets
-df_train, df_test = train_test_split(
-    df_final, 
-    test_size=0.2, 
-    random_state=42, 
-    stratify=df_final['label']
+print("3. Splitting into Train (80%) and Test (20%) -- stratified, "
+      "computed only on the small patid/label table...")
+train_ids_df, test_ids_df = train_test_split(
+    patient_labels_df,
+    test_size=0.2,
+    random_state=42,
+    stratify=patient_labels_df['label']
 )
 
-# Save the final files for Colab
-df_train.to_parquet('data/diabetes_train.parquet', index=False)
-df_test.to_parquet('data/diabetes_test.parquet', index=False)
+# Register the small id sets back into DuckDB so we can filter the big
+# sequence table with a plain SQL JOIN/IN -- still no pandas conversion of
+# the sequence data itself.
+con.register('train_ids', train_ids_df)
+con.register('test_ids', test_ids_df)
+
+print("4. Writing train/test sequence parquet files (entirely in DuckDB)...")
+
+for split_name, ids_table in [('train', 'train_ids'), ('test', 'test_ids')]:
+    out_query = f"""
+        SELECT seq.patid, seq.code, seq.age, ids.label
+        FROM read_parquet('0data/behrt_finetuning_data.parquet') seq
+        INNER JOIN {ids_table} ids ON seq.patid = ids.patid
+    """
+    con.execute(f"COPY ({out_query}) TO '0data/diabetes_{split_name}.parquet' (FORMAT PARQUET);")
+    print(f"   Saved 0data/diabetes_{split_name}.parquet")
 
 print("--------------------------------------------------")
 print("DATA PREPARATION COMPLETED!")
-print(f"Total patients for Training (Train): {len(df_train)}")
-print(f"Total patients for Testing (Test): {len(df_test)}")
+print(f"Total patients for Training (Train): {len(train_ids_df)}")
+print(f"Total patients for Testing (Test): {len(test_ids_df)}")
 print("\nLabel distribution in Train:")
-print(df_train['label'].value_counts())
+print(train_ids_df['label'].value_counts())
 print("--------------------------------------------------")
 print("Next stop: Google Colab for Fine-Tuning!")

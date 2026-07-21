@@ -1,59 +1,74 @@
+"""
+01_build_universal_events.py
+
+Builds universal_events.parquet for the FINE-TUNING pipeline: combines
+Diagnoses (DX) + discretized Labs/Vitals, applying the same temporal
+censoring (GOLDEN RULE) used in generate_pretrain_data.py -- for diabetic
+patients, only events BEFORE their Index_Date (first diagnosis date) are
+kept; controls keep their entire history.
+
+IMPORTANT (confirmed design decision): medications (RX) are NOT included.
+Features are DX + LABS + VITALS, matching the pretraining feature set.
+Demographics (gender/race/ethnicity) are also not included as tokens -- they
+are only used to compute AGE (per-event age), same as in pretraining.
+"""
+
 import duckdb
 
-# 1. Connect to DuckDB
 con = duckdb.connect()
 
-print("Fusing Diagnoses and Medications and applying Temporal Censoring (Data Leakage Prevention)...")
+print("Combining Diagnoses + Labs/Vitals and applying temporal censoring (data leakage prevention)...")
 
-# 2. Advanced SQL query with data leakage prevention
 query = """
-    -- Step A: Obtain Diagnoses
     WITH Diagnosis AS (
-        SELECT 
-            PATIENT_ID, 
-            CAST(Shifted_date AS DATE) AS DATE, 
-            'DX:' || CAST(DX AS VARCHAR) AS CODE 
-        FROM read_csv_auto('data/deid_visit_dx.csv')
+        SELECT
+            PATIENT_ID,
+            CAST(Shifted_date AS DATE) AS DATE,
+            'DX:' || CAST(DX AS VARCHAR) AS CODE
+        FROM read_csv_auto('0data/deid_visit_dx.csv')
     ),
-    
-    -- Step B: Obtain Medications
-    Medications AS (
-        SELECT 
-            PATIENT_ID, 
-            CAST(Shifted_date AS DATE) AS DATE, 
-            'RX:' || CAST(RX_CODE AS VARCHAR) AS CODE 
-        FROM read_csv_auto('data/deid_rx_order.csv')
+    LabsVitals AS (
+        SELECT
+            PATIENT_ID,
+            CAST(DATE AS DATE) AS DATE,
+            CODE
+        FROM read_csv_auto('0data/discretized_labs_vitals.csv')
     ),
-    
-    -- Step C: Combine all events (The original Universal Events)
     Universal_Events AS (
         SELECT * FROM Diagnosis
         UNION ALL
-        SELECT * FROM Medications
+        SELECT * FROM LabsVitals
     ),
-    
-    -- Step D: Load the exact diabetes diagnosis dates
     Diabetes_dates AS (
-        SELECT 
-            PATIENT_ID, 
+        SELECT
+            PATIENT_ID,
             CAST(EARLIEST_DX AS DATE) AS Index_Date
-        FROM read_csv_auto('data/EARLIEST_dx_deid.csv')
+        FROM read_csv_auto('0data/EARLIEST_dx_deid.csv')
     )
-    
-    -- Step E: Final Filtering (Temporal Censoring)
-    SELECT 
-        u.PATIENT_ID, 
-        u.DATE, 
+    -- GOLDEN RULE:
+    -- If the patient is not in the diabetes table (Index_Date IS NULL),
+    -- include their entire history (they are a control).
+    -- If they are diabetic, only include events BEFORE their diagnosis (<).
+    SELECT
+        u.PATIENT_ID,
+        u.DATE,
         u.CODE
     FROM Universal_Events u
     LEFT JOIN Diabetes_dates f ON u.PATIENT_ID = f.PATIENT_ID
-    -- GOLDEN RULE:
-    -- If the patient is not in the diabetes table (f.Index_Date IS NULL), include all events.
-    -- If the patient is diabetic, only include events BEFORE their diagnosis (<)
     WHERE f.Index_Date IS NULL OR u.DATE < f.Index_Date
 """
 
-# 3. Run and save
-con.execute(f"COPY ({query}) TO 'data/universal_events.parquet' (FORMAT PARQUET);")
+con.execute(f"COPY ({query}) TO '0data/universal_events.parquet' (FORMAT PARQUET);")
 
-print("Success! Cleaned and censored events saved to 'data/universal_events.parquet'.")
+print("Success! Censored events (DX + LABS + VITALS) saved to '0data/universal_events.parquet'.")
+
+# Quick sanity-check summary
+summary = con.execute("""
+    SELECT
+        CASE WHEN CODE LIKE 'DX:%' THEN 'DX' ELSE 'LAB/VITAL' END AS type,
+        COUNT(*) AS n
+    FROM read_parquet('0data/universal_events.parquet')
+    GROUP BY 1
+""").df()
+print("\nCensored events summary:")
+print(summary.to_string(index=False))
