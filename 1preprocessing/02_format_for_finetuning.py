@@ -53,6 +53,18 @@ print(f"DuckDB configured with memory_limit={MEMORY_LIMIT_GB}GB, "
 # ---------------------------------------------------------------------------
 print("\n[1/3] Computing per-event AGE and assigning patient buckets...")
 
+# Clean up any leftover output from a previous run. This matters for
+# correctness, not just convenience: output_buckets/ has "skip if already
+# processed" logic meant for resuming after an interrupted run, but if left
+# over from a run on DIFFERENT input data (e.g. before a data-leakage fix
+# upstream), it would silently reuse stale results instead of failing loudly.
+import shutil
+events_with_age_dir = f"{TMP_DIR}/events_with_age"
+output_buckets_dir = f"{TMP_DIR}/output_buckets"
+for stale_dir in (events_with_age_dir, output_buckets_dir):
+    if os.path.exists(stale_dir):
+        shutil.rmtree(stale_dir)
+
 stage1_query = f"""
     WITH Events AS (
         SELECT PATIENT_ID, DATE, CODE

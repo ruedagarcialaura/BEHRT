@@ -1,39 +1,51 @@
 """
 04_generate_horizon_test_sets.py
 
-Genera versiones del TEST SET censuradas a distintos horizontes de predicción
-(5, 3, 2 y 1 año antes del evento de referencia), para evaluar cómo se degrada
-el rendimiento del modelo cuanto más lejos del diagnóstico se hace la predicción.
+Generates TEST SET versions censored at different prediction horizons
+(5, 3, 2 and 1 year before the reference event), to evaluate how model
+performance degrades the further out the prediction is made from diagnosis.
 
-IMPORTANTE:
-- El TRAIN SET no se toca aquí. Sigue usando el histórico completo
-  pre-diagnóstico, tal y como lo genera 03_train_and_test_split.py.
-- La población de pacientes de test es SIEMPRE la misma en los 4 horizontes
-  (viene de data/diabetes_test.parquet). Lo único que cambia es cuánta
-  historia de cada paciente se le deja ver al modelo.
+IMPORTANT:
+- The TRAIN SET is not touched here. It keeps using the full pre-diagnosis
+  history, as produced by 03_train_and_test_split.py.
+- The test-set patient population is ALWAYS the same across all 4 horizons
+  (comes from 0data/diabetes_test.parquet). Only how much of each patient's
+  history the model gets to see changes.
 
-Regla de censura por horizonte:
-- Casos (diabéticos):    cutoff = Index_Date (EARLIEST_DX) - N años
-- Controles (no diab.):  cutoff = última fecha de visita en su historial
-                          (ya censurado a nivel de universal_events.parquet)
-                          - N años
-  -> Esta es la Opción "A" (más simple). Queda documentado como limitación
-     metodológica: a diferencia de un matching caso-control por fecha índice
-     (Opción C), los controles con historiales más cortos/discontinuos
-     pueden perder más pacientes al aplicar el cutoff, lo que puede sesgar
-     la muestra de controles superviviente hacia pacientes con seguimiento
-     más largo. Mencionar esto explícitamente en la sección de limitaciones
-     de la tesis.
+Censoring rule per horizon:
+- Cases (diabetic):     cutoff = Index_Date (EARLIEST_DX) - N years
+- Controls (non-diab.): cutoff = last visit date in their history (already
+                         censored at the universal_events.parquet level) - N years
+  -> This is "Option A" (simpler). Documented as a methodological
+     limitation: unlike case-control matching by index date (Option C),
+     controls with shorter/discontinuous histories may lose more patients
+     when the cutoff is applied, which can bias the surviving control
+     sample towards patients with longer follow-up. Mention this explicitly
+     in the thesis limitations section.
 """
 
 import pandas as pd
 import numpy as np
+import duckdb
 import os
 
 HORIZONS_YEARS = [5, 3, 2, 1]
 
-DATA_DIR = 'data'
-OUT_DIR = 'data'
+BEHRT_ROOT = "/content/drive/MyDrive/Colab Notebooks/BEHRT"
+DATA_DIR = os.path.join(BEHRT_ROOT, "0data")
+OUT_DIR = DATA_DIR
+
+
+def read_parquet_safe(path):
+    """Plain pd.read_parquet() can throw
+    'ArrowNotImplementedError: Nested data conversions not implemented for
+    chunked array outputs' on parquet files with large list-type columns
+    (our 'code'/'age' sequences -- some patients have 60k+ tokens even after
+    the leakage fix). DuckDB reads and converts these to pandas without
+    hitting that limitation."""
+    con = duckdb.connect()
+    return con.execute(f"SELECT * FROM read_parquet('{path}')").df()
+
 
 print("=" * 60)
 print(" GENERATING HORIZON-CENSORED TEST SETS (5y / 3y / 2y / 1y) ")
@@ -43,7 +55,7 @@ print("=" * 60)
 # 1. Fixed test-set population (same patients across all horizons)
 # ---------------------------------------------------------------------------
 print("\n[1/5] Loading fixed test-set patient IDs and labels...")
-df_test_base = pd.read_parquet(os.path.join(DATA_DIR, 'diabetes_test.parquet'))
+df_test_base = read_parquet_safe(os.path.join(DATA_DIR, 'diabetes_test.parquet'))
 test_patids = set(df_test_base['patid'].unique())
 labels = df_test_base.set_index('patid')['label'].to_dict()
 print(f"      Test set has {len(test_patids)} patients "
@@ -51,8 +63,9 @@ print(f"      Test set has {len(test_patids)} patients "
       f"{sum(v == 0 for v in labels.values())} controls).")
 
 # ---------------------------------------------------------------------------
-# 2. Already-censored universal events (DX + RX, censored at Index_Date for
-#    cases, per 01_build_universal_events.py), restricted to test patients.
+# 2. Already-censored universal events (DX + LABS + VITALS, censored at
+#    Index_Date for cases, per 01_build_universal_events.py), restricted to
+#    test patients only.
 # ---------------------------------------------------------------------------
 print("\n[2/5] Loading censored universal events for test patients...")
 events_df = pd.read_parquet(os.path.join(DATA_DIR, 'universal_events.parquet'))
@@ -65,8 +78,16 @@ print(f"      {events_df['PATIENT_ID'].nunique()} test patients found with event
 # 3. Reference dates: Index_Date for cases, last visit date for controls
 # ---------------------------------------------------------------------------
 print("\n[3/5] Computing per-patient reference dates...")
-dx_dates = pd.read_csv(os.path.join(DATA_DIR, 'EARLIEST_dx_deid.csv'))
+dx_dates = pd.read_csv(os.path.join(DATA_DIR, 'EARLIEST_DX_deid.csv'))
 dx_dates['EARLIEST_DX'] = pd.to_datetime(dx_dates['EARLIEST_DX'])
+# CRITICAL FIX: EARLIEST_dx_deid.csv has one row per (PATIENT_ID, DX) pair,
+# not one row per patient -- each distinct diagnosis code has its own
+# "first occurrence" date. Without MIN()+GROUP BY, .set_index().to_dict()
+# would just keep whichever row happens to be last for a given patient (not
+# necessarily their true earliest diagnosis) -- must aggregate with min()
+# per patient first, same fix applied in 01_build_universal_events.py and
+# generate_pretrain_data.py.
+dx_dates = dx_dates.groupby('PATIENT_ID')['EARLIEST_DX'].min().reset_index()
 index_date_map = dx_dates.set_index('PATIENT_ID')['EARLIEST_DX'].to_dict()
 
 last_visit_map = events_df.groupby('PATIENT_ID')['DATE'].max().to_dict()

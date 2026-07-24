@@ -55,7 +55,7 @@ import seaborn as sns
 BEHRT_ROOT = "/content/drive/MyDrive/Colab Notebooks/BEHRT"
 DATA_DIR = os.path.join(BEHRT_ROOT, "0data")
 VOCAB_PATH = os.path.join(DATA_DIR, "vocab.pkl")
-MODEL_WEIGHTS_PATH = os.path.join(BEHRT_ROOT, "saved_models", "balanced_diabetes_model_epoch_4.pth")  # <- adjust to your best checkpoint
+MODEL_WEIGHTS_PATH = os.path.join(BEHRT_ROOT, "saved_models", "balanced_diabetes_model_iter_4.pth")
 OUTPUT_DIR = os.path.join(BEHRT_ROOT, "results", "evaluation")
 
 MAX_SEQ_LENGTH = 300
@@ -78,6 +78,13 @@ TEST_SETS = {
 SHAP_N_PATIENTS = 150
 SHAP_N_BACKGROUND = 8  # copies of the PAD baseline used as reference
 SHAP_TOP_K = 20
+
+# Number of bootstrap resamples for the mean +/- std reported alongside
+# every metric (Option A: resample the test set with replacement, model is
+# only trained once -- NOT retraining with different seeds, which would be
+# Option B and much more expensive). 1000 is standard and still fast since
+# it operates on already-computed predictions, no re-inference needed.
+N_BOOTSTRAP = 1000
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -291,6 +298,51 @@ def evaluate_dataset(model, dataset, horizon_name):
         "recall": recall_score(all_labels, all_preds),
         "specificity": specificity,
     }
+
+    # ------------------------------------------------------------------
+    # Bootstrap resampling (Option A): resample the test set WITH
+    # replacement N_BOOTSTRAP times, recomputing every metric on each
+    # resample. This is only a single trained model -- it measures
+    # uncertainty coming from "which patients happened to be in this test
+    # set", not uncertainty from model training/initialization (that would
+    # require retraining with different seeds, a separate and much more
+    # expensive analysis). Cheap: operates on already-computed
+    # probabilities/predictions, no re-inference through the model.
+    # ------------------------------------------------------------------
+    rng = np.random.default_rng(42)
+    n = len(all_labels)
+    boot_metrics = {"roc_auc": [], "f1": [], "precision": [], "recall": [], "specificity": []}
+
+    for _ in range(N_BOOTSTRAP):
+        idx = rng.integers(0, n, size=n)
+        b_labels = all_labels[idx]
+        b_probs = all_probs[idx]
+        b_preds = all_preds[idx]
+
+        if b_labels.sum() == 0 or b_labels.sum() == len(b_labels):
+            continue  # skip resamples that end up single-class (rare)
+
+        b_cm = confusion_matrix(b_labels, b_preds, labels=[0, 1])
+        b_TN, b_FP, b_FN, b_TP = b_cm.ravel()
+        b_specificity = b_TN / (b_TN + b_FP) if (b_TN + b_FP) > 0 else np.nan
+
+        boot_metrics["roc_auc"].append(roc_auc_score(b_labels, b_probs))
+        boot_metrics["f1"].append(f1_score(b_labels, b_preds, zero_division=0))
+        boot_metrics["precision"].append(precision_score(b_labels, b_preds, zero_division=0))
+        boot_metrics["recall"].append(recall_score(b_labels, b_preds, zero_division=0))
+        boot_metrics["specificity"].append(b_specificity)
+
+    for metric_name, values in boot_metrics.items():
+        values = np.array(values)
+        metrics[f"{metric_name}_mean"] = float(np.mean(values))
+        metrics[f"{metric_name}_std"] = float(np.std(values))
+
+    print(f"  [{horizon_name}] Bootstrap (n={N_BOOTSTRAP} resamples) -- "
+          f"AUC={metrics['roc_auc_mean']:.4f}+/-{metrics['roc_auc_std']:.4f}  "
+          f"F1={metrics['f1_mean']:.4f}+/-{metrics['f1_std']:.4f}  "
+          f"Prec={metrics['precision_mean']:.4f}+/-{metrics['precision_std']:.4f}  "
+          f"Rec={metrics['recall_mean']:.4f}+/-{metrics['recall_std']:.4f}  "
+          f"Spec={metrics['specificity_mean']:.4f}+/-{metrics['specificity_std']:.4f}")
 
     plt.figure(figsize=(6, 5))
     sns.heatmap(cm, annot=True, fmt="d", cmap="Blues",

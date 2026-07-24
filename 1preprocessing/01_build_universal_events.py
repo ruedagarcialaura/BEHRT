@@ -40,10 +40,19 @@ query = """
         SELECT * FROM LabsVitals
     ),
     Diabetes_dates AS (
+        -- CRITICAL FIX: EARLIEST_dx_deid.csv has ONE ROW PER (PATIENT_ID, DX)
+        -- pair, not one row per patient -- each distinct diagnosis code has
+        -- its own "first occurrence" date. Without MIN()+GROUP BY, the JOIN
+        -- below would match each event against ALL of a patient's index
+        -- dates, and an event only needs to be before ONE of them to pass
+        -- the WHERE filter -- letting events AFTER the patient's TRUE
+        -- earliest diagnosis leak through as long as they're before some
+        -- LATER "first occurrence of a different diabetes code" date.
         SELECT
             PATIENT_ID,
-            CAST(EARLIEST_DX AS DATE) AS Index_Date
+            MIN(CAST(EARLIEST_DX AS DATE)) AS Index_Date
         FROM read_csv_auto('0data/EARLIEST_dx_deid.csv')
+        GROUP BY PATIENT_ID
     )
     -- GOLDEN RULE:
     -- If the patient is not in the diabetes table (Index_Date IS NULL),

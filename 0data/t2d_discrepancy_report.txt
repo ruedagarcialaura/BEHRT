@@ -1,0 +1,11 @@
+=== 1. Of patients with a T2D-related index date, their AIM_GROUP label ===
+2_Type2    20131
+Name: count, dtype: int64
+
+Patients with a T2D index date but NOT labeled '2_Type2': 0
+
+=== 2. Top 20 DX codes among the mismatched (non-'2_Type2') group ===
+
+=== 3. '2_Type2' patients with NO T2D-prefixed index date at all ===
+  0 of 20,131 (0.0%)
+  Of those, 0 have a non-T2D row in Earliest_dx_deid (so the table isn't simply missing them entirely)
